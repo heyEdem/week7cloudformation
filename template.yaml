@@ -1,74 +1,106 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: VPC, ECS Cluster, ALB, and related resources for Notable App
+Description: VPC, ECS Cluster, ALB, and Blue/Green Deployment for Notable Todo App
 
 Parameters:
-  TodoTableArn:
+  EnvironmentName:
+    Description: Environment name prefixed to resource names
     Type: String
-    Description: ARN of the NotableItems DynamoDB table
+    Default: notable
+  VpcCIDR:
+    Description: CIDR block for the VPC
+    Type: String
+    Default: 10.0.0.0/16
+  PublicSubnet1CIDR:
+    Description: CIDR block for public subnet in AZ 1
+    Type: String
+    Default: 10.0.1.0/24
+  PublicSubnet2CIDR:
+    Description: CIDR block for public subnet in AZ 2
+    Type: String
+    Default: 10.0.2.0/24
+  PrivateSubnet1CIDR:
+    Description: CIDR block for private subnet in AZ 1
+    Type: String
+    Default: 10.0.3.0/24
+  PrivateSubnet2CIDR:
+    Description: CIDR block for private subnet in AZ 2
+    Type: String
+    Default: 10.0.4.0/24
+  ContainerPort:
+    Description: Port that the Notable container exposes
+    Type: Number
+    Default: 5000  # Adjust if your app uses a different port
+  ECRRepositoryUri:
+    Description: URI of the existing Notable ECR repository
+    Type: String
+    Default: 650251709711.dkr.ecr.us-east-1.amazonaws.com/notable
+  DynamoDBTableName:
+    Description: Name of the existing Notable DynamoDB table
+    Type: String
+    Default: Notable
 
 Resources:
-  # VPC with public and private subnets
+  # VPC and Networking
   VPC:
     Type: AWS::EC2::VPC
     Properties:
-      CidrBlock: 10.0.0.0/16
-      EnableDnsHostnames: true
+      CidrBlock: !Ref VpcCIDR
       EnableDnsSupport: true
+      EnableDnsHostnames: true
       Tags:
         - Key: Name
-          Value: NotableVPC
+          Value: !Sub "${EnvironmentName}-VPC"
 
-  # Public Subnets
   PublicSubnet1:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref VPC
-      CidrBlock: 10.0.1.0/24
-      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref PublicSubnet1CIDR
       MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs ""]
       Tags:
         - Key: Name
-          Value: PublicSubnet1
+          Value: !Sub "${EnvironmentName}-PublicSubnet1"
 
   PublicSubnet2:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref VPC
-      CidrBlock: 10.0.2.0/24
-      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref PublicSubnet2CIDR
       MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [1, !GetAZs ""]
       Tags:
         - Key: Name
-          Value: PublicSubnet2
+          Value: !Sub "${EnvironmentName}-PublicSubnet2"
 
-  # Private Subnets
   PrivateSubnet1:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref VPC
-      CidrBlock: 10.0.3.0/24
-      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref PrivateSubnet1CIDR
+      MapPublicIpOnLaunch: false
+      AvailabilityZone: !Select [0, !GetAZs ""]
       Tags:
         - Key: Name
-          Value: PrivateSubnet1
+          Value: !Sub "${EnvironmentName}-PrivateSubnet1"
 
   PrivateSubnet2:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref VPC
-      CidrBlock: 10.0.4.0/24
-      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref PrivateSubnet2CIDR
+      MapPublicIpOnLaunch: false
+      AvailabilityZone: !Select [1, !GetAZs ""]
       Tags:
         - Key: Name
-          Value: PrivateSubnet2
+          Value: !Sub "${EnvironmentName}-PrivateSubnet2"
 
-  # Internet Gateway for public subnets
   InternetGateway:
     Type: AWS::EC2::InternetGateway
     Properties:
       Tags:
         - Key: Name
-          Value: NotableIGW
+          Value: !Sub "${EnvironmentName}-IGW"
 
   AttachGateway:
     Type: AWS::EC2::VPCGatewayAttachment
@@ -76,20 +108,35 @@ Resources:
       VpcId: !Ref VPC
       InternetGatewayId: !Ref InternetGateway
 
-  # Route Table for public subnets
+  NatGatewayEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-NAT"
+
   PublicRouteTable:
     Type: AWS::EC2::RouteTable
     Properties:
       VpcId: !Ref VPC
       Tags:
         - Key: Name
-          Value: PublicRouteTable
+          Value: !Sub "${EnvironmentName}-PublicRouteTable"
 
   PublicRoute:
     Type: AWS::EC2::Route
+    DependsOn: AttachGateway
     Properties:
       RouteTableId: !Ref PublicRouteTable
-      DestinationCidrBlock: 0.0.0.0/0
+      DestinationCidrBlock: "0.0.0.0/0"
       GatewayId: !Ref InternetGateway
 
   PublicSubnet1RouteTableAssociation:
@@ -104,36 +151,20 @@ Resources:
       SubnetId: !Ref PublicSubnet2
       RouteTableId: !Ref PublicRouteTable
 
-  # NAT Gateway for private subnets
-  EIP:
-    Type: AWS::EC2::EIP
-    Properties:
-      Domain: vpc
-
-  NATGateway:
-    Type: AWS::EC2::NatGateway
-    Properties:
-      AllocationId: !GetAtt EIP.AllocationId
-      SubnetId: !Ref PublicSubnet1
-      Tags:
-        - Key: Name
-          Value: NotableNAT
-
-  # Route Table for private subnets
   PrivateRouteTable:
     Type: AWS::EC2::RouteTable
     Properties:
       VpcId: !Ref VPC
       Tags:
         - Key: Name
-          Value: PrivateRouteTable
+          Value: !Sub "${EnvironmentName}-PrivateRouteTable"
 
   PrivateRoute:
     Type: AWS::EC2::Route
     Properties:
       RouteTableId: !Ref PrivateRouteTable
-      DestinationCidrBlock: 0.0.0.0/0
-      NatGatewayId: !Ref NATGateway
+      DestinationCidrBlock: "0.0.0.0/0"
+      NatGatewayId: !Ref NatGateway
 
   PrivateSubnet1RouteTableAssociation:
     Type: AWS::EC2::SubnetRouteTableAssociation
@@ -147,21 +178,12 @@ Resources:
       SubnetId: !Ref PrivateSubnet2
       RouteTableId: !Ref PrivateRouteTable
 
-  # VPC Endpoints for DynamoDB, ECR, and S3 (for private subnet connectivity)
+  # VPC Endpoints for DynamoDB and ECR
   DynamoDBEndpoint:
     Type: AWS::EC2::VPCEndpoint
     Properties:
       VpcId: !Ref VPC
-      ServiceName: !Sub com.amazonaws.${AWS::Region}.dynamodb
-      VpcEndpointType: Gateway
-      RouteTableIds:
-        - !Ref PrivateRouteTable
-
-  S3Endpoint:
-    Type: AWS::EC2::VPCEndpoint
-    Properties:
-      VpcId: !Ref VPC
-      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.dynamodb"
       VpcEndpointType: Gateway
       RouteTableIds:
         - !Ref PrivateRouteTable
@@ -170,7 +192,7 @@ Resources:
     Type: AWS::EC2::VPCEndpoint
     Properties:
       VpcId: !Ref VPC
-      ServiceName: !Sub com.amazonaws.${AWS::Region}.ecr.dkr
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ecr.dkr"
       VpcEndpointType: Interface
       SubnetIds:
         - !Ref PrivateSubnet1
@@ -182,28 +204,51 @@ Resources:
   VPCEndpointSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Security group for VPC Endpoints
+      GroupDescription: "Security group for VPC Endpoints"
       VpcId: !Ref VPC
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 443
           ToPort: 443
-          CidrIp: 10.0.0.0/16
+          CidrIp: !Ref VpcCIDR
 
   # ECS Cluster
-  ECSCluster:
+  NotableCluster:
     Type: AWS::ECS::Cluster
     Properties:
-      ClusterName: NotableCluster
+      ClusterName: !Sub "${EnvironmentName}-Cluster"
 
-  # ECR Repository
-  ECRRepository:
-    Type: AWS::ECR::Repository
+  # Security Groups
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
     Properties:
-      RepositoryName: notable
+      GroupDescription: "Allow HTTP traffic to the Load Balancer"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
 
-  # IAM Role for ECS Task Execution
-  ECSTaskExecutionRole:
+  ECSServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Allow traffic from ALB to ECS service"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  # IAM Roles
+  TaskExecutionRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
@@ -227,119 +272,11 @@ Resources:
                   - dynamodb:DeleteItem
                   - dynamodb:Scan
                   - dynamodb:GetItem
-                Resource: !Ref TodoTableArn
-
-  # Security Group for ALB
-  ALBSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: Security group for ALB
-      VpcId: !Ref VPC
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 80
-          ToPort: 80
-          CidrIp: 0.0.0.0/0
-
-  # Security Group for ECS Tasks
-  ECSSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: Security group for ECS tasks
-      VpcId: !Ref VPC
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 8080
-          ToPort: 8080
-          SourceSecurityGroupId: !Ref ALBSecurityGroup
-
-  # Application Load Balancer
-  ALB:
-    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
-    Properties:
-      Subnets:
-        - !Ref PublicSubnet1
-        - !Ref PublicSubnet2
-      SecurityGroups:
-        - !Ref ALBSecurityGroup
-      Tags:
-        - Key: Name
-          Value: NotableALB
-
-  ALBListener:
-    Type: AWS::ElasticLoadBalancingV2::Listener
-    Properties:
-      LoadBalancerArn: !Ref ALB
-      Port: 80
-      Protocol: HTTP
-      DefaultActions:
-        - Type: forward
-          TargetGroupArn: !Ref BlueTargetGroup
-
-  # Target Groups for Blue/Green Deployment
-  BlueTargetGroup:
-    Type: AWS::ElasticLoadBalancingV2::TargetGroup
-    Properties:
-      VpcId: !Ref VPC
-      Port: 8080
-      Protocol: HTTP
-      TargetType: ip
-      HealthCheckPath: /
-      Tags:
-        - Key: Name
-          Value: NotableBlueTargetGroup
-
-  GreenTargetGroup:
-    Type: AWS::ElasticLoadBalancingV2::TargetGroup
-    Properties:
-      VpcId: !Ref VPC
-      Port: 8080
-      Protocol: HTTP
-      TargetType: ip
-      HealthCheckPath: /
-      Tags:
-        - Key: Name
-          Value: NotableGreenTargetGroup
-
-  # CodeDeploy Application and Deployment Group
-  CodeDeployApplication:
-    Type: AWS::CodeDeploy::Application
-    Properties:
-      ComputePlatform: ECS
-      ApplicationName: NotableApp
-
-  CodeDeployDeploymentGroup:
-    Type: AWS::CodeDeploy::DeploymentGroup
-    Properties:
-      ApplicationName: !Ref CodeDeployApplication
-      ServiceRoleArn: !GetAtt CodeDeployRole.Arn
-      DeploymentConfigName: CodeDeployDefault.ECSAllAtOnce
-      DeploymentGroupName: NotableDeploymentGroup
-      AutoRollbackConfiguration:
-        Enabled: true
-        Events:
-          - DEPLOYMENT_FAILURE
-      BlueGreenDeploymentConfiguration:
-        TerminateBlueInstancesOnDeploymentSuccess:
-          Action: TERMINATE
-          TerminationWaitTimeInMinutes: 5
-        DeploymentReadyOption:
-          ActionOnTimeout: CONTINUE_DEPLOYMENT
-      DeploymentStyle:
-        DeploymentOption: WITH_TRAFFIC_CONTROL
-        DeploymentType: BLUE_GREEN
-      LoadBalancerInfo:
-        TargetGroupPairInfoList:
-          - ProdTargetGroup:
-              !Ref BlueTargetGroup
-            TestTargetGroup:
-              !Ref GreenTargetGroup
-      EcsServices:
-        - ServiceName: !Ref ECSService
-          ClusterName: !Ref ECSCluster
-
-  # IAM Role for CodeDeploy
-  CodeDeployRole:
+                  - dynamodb:DescribeTable
+                  - dynamodb:CreateTable
+                Resource:
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${DynamoDBTableName}"
+  CodeDeployServiceRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
@@ -352,72 +289,169 @@ Resources:
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AWSCodeDeployRoleForECS
 
-  # ECS Task Definition (Placeholder - will be updated by pipeline)
+  # ECS Task Definition
   ECSTaskDefinition:
     Type: AWS::ECS::TaskDefinition
     Properties:
-      Family: notable-task
-      NetworkMode: awsvpc
+      Family: !Sub "${EnvironmentName}-task"
       RequiresCompatibilities:
         - FARGATE
       Cpu: '256'
       Memory: '512'
-      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
-      TaskRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      NetworkMode: awsvpc
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskExecutionRole.Arn
       ContainerDefinitions:
-        - Name: notable
-          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/notable:latest
+        - Name: notable-container
+          Image: public.ecr.aws/r1b3l1w9/notable:latest
           PortMappings:
-            - ContainerPort: 8080
+            - ContainerPort: !Ref ContainerPort
           Environment:
             - Name: DYNAMODB_TABLE
-              Value: NotableItems
+              Value: !Ref DynamoDBTableName
             - Name: AWS_REGION
               Value: !Ref AWS::Region
           LogConfiguration:
             LogDriver: awslogs
             Options:
-              awslogs-group: /ecs/notable
+              awslogs-group: !Ref ECSLogGroup
               awslogs-region: !Ref AWS::Region
               awslogs-stream-prefix: ecs
+
+  ECSLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "${EnvironmentName}-log-group"
+      RetentionInDays: 7
+
+  # Load Balancer
+  NotableLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${EnvironmentName}-load-balancer"
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref LoadBalancerSecurityGroup
+      Scheme: internet-facing
+      Type: application
+
+  BlueTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${EnvironmentName}-blue-target"
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: ip
+      HealthCheckPath: "/"  # Adjust if Notable has a specific health endpoint
+      HealthCheckTimeoutSeconds: 5
+      HealthCheckIntervalSeconds: 30
+
+  GreenTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${EnvironmentName}-green-target"
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: ip
+      HealthCheckPath: "/"  # Adjust if Notable has a specific health endpoint
+      HealthCheckTimeoutSeconds: 5
+      HealthCheckIntervalSeconds: 30
+
+  ProductionListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref BlueTargetGroup
+      LoadBalancerArn: !Ref NotableLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  TestListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref GreenTargetGroup
+      LoadBalancerArn: !Ref NotableLoadBalancer
+      Port: 5000  # Test port for green deployment
+      Protocol: HTTP
 
   # ECS Service
   ECSService:
     Type: AWS::ECS::Service
+    DependsOn:
+      - ProductionListener
     Properties:
-      Cluster: !Ref ECSCluster
-      ServiceName: NotableService
+      ServiceName: !Sub "${EnvironmentName}-service"
+      Cluster: !Ref NotableCluster
       TaskDefinition: !Ref ECSTaskDefinition
-      DesiredCount: 1
       LaunchType: FARGATE
+      DesiredCount: 1
       NetworkConfiguration:
         AwsvpcConfiguration:
           Subnets:
             - !Ref PrivateSubnet1
             - !Ref PrivateSubnet2
-          SecurityGroups:
-            - !Ref ECSSecurityGroup
           AssignPublicIp: DISABLED
+          SecurityGroups:
+            - !Ref ECSServiceSecurityGroup
+      LoadBalancers:
+        - TargetGroupArn: !Ref BlueTargetGroup
+          ContainerName: notable-container
+          ContainerPort: !Ref ContainerPort
       DeploymentController:
         Type: CODE_DEPLOY
 
-  # CloudWatch Log Group for ECS Tasks
-  LogGroup:
-    Type: AWS::Logs::LogGroup
+  # CodeDeploy
+  CodeDeployApplication:
+    Type: AWS::CodeDeploy::Application
     Properties:
-      LogGroupName: /ecs/notable
-      RetentionInDays: 7
+      ApplicationName: !Sub "${EnvironmentName}-application"
+      ComputePlatform: ECS
+
+  DeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref CodeDeployApplication
+      ServiceRoleArn: !GetAtt CodeDeployServiceRole.Arn
+      DeploymentConfigName: CodeDeployDefault.ECSAllAtOnce
+      DeploymentGroupName: !Sub "${EnvironmentName}-deployment-group"
+      DeploymentStyle:
+        DeploymentType: BLUE_GREEN
+        DeploymentOption: WITH_TRAFFIC_CONTROL
+      BlueGreenDeploymentConfiguration:
+        DeploymentReadyOption:
+          ActionOnTimeout: CONTINUE_DEPLOYMENT
+        TerminateBlueInstancesOnDeploymentSuccess:
+          Action: TERMINATE
+          TerminationWaitTimeInMinutes: 5
+      ECSServices:
+        - ClusterName: !Ref NotableCluster
+          ServiceName: !GetAtt ECSService.Name
+      LoadBalancerInfo:
+        TargetGroupPairInfoList:
+          - ProdTrafficRoute:
+              ListenerArns:
+                - !Ref ProductionListener
+            TestTrafficRoute:
+              ListenerArns:
+                - !Ref TestListener
+            TargetGroups:
+              - Name: !GetAtt BlueTargetGroup.TargetGroupName
+              - Name: !GetAtt GreenTargetGroup.TargetGroupName
 
 Outputs:
-  ALBEndpoint:
-    Description: URL of the Application Load Balancer
-    Value: !Sub http://${ALB.DNSName}
-  ECRRepositoryUri:
-    Description: URI of the ECR Repository
-    Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/notable
+  LoadBalancerURL:
+    Description: URL of the load balancer
+    Value: !Sub "http://${NotableLoadBalancer.DNSName}"
   ECSClusterName:
     Description: Name of the ECS Cluster
-    Value: !Ref ECSCluster
+    Value: !Ref NotableCluster
   ECSServiceName:
     Description: Name of the ECS Service
     Value: !Ref ECSService
@@ -426,4 +460,4 @@ Outputs:
     Value: !Ref CodeDeployApplication
   CodeDeployDeploymentGroupName:
     Description: Name of the CodeDeploy Deployment Group
-    Value: !Ref CodeDeployDeploymentGroup
+    Value: !Ref DeploymentGroup
